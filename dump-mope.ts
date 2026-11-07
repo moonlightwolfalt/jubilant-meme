@@ -16,6 +16,7 @@
  * Usage:
  *   bun dump-mope.ts [--date 20210321] [--window 30] [--out dump]
  *                    [--concurrency 4] [--domain mope.io] [--no-crawl] [--dry-run]
+ *   bun dump-mope.ts --live --domain v1.mope.io   # crawl the live site instead
  *   bun dump-mope.ts --serve [--out dump] [--port 8080]
  */
 
@@ -34,6 +35,7 @@ type Opts = {
   dryRun: boolean;
   serve: boolean;
   port: number;
+  live: boolean;
 };
 
 function parseArgs(argv: string[]): Opts {
@@ -47,6 +49,7 @@ function parseArgs(argv: string[]): Opts {
     dryRun: false,
     serve: false,
     port: 8080,
+    live: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -65,6 +68,7 @@ function parseArgs(argv: string[]): Opts {
       case "--dry-run": o.dryRun = true; break;
       case "--serve": o.serve = true; break;
       case "--port": o.port = Number(next()); break;
+      case "--live": o.live = true; break;
       case "-h":
       case "--help":
         console.log(readHelp());
@@ -87,6 +91,8 @@ function readHelp() {
   --domain HOST       site to dump (default mope.io, subdomains included)
   --no-crawl          only download what the CDX listing returns
   --dry-run           list what would be downloaded, write nothing
+  --live              crawl the live site instead of the Wayback Machine
+                      (e.g. --live --domain v1.mope.io)
   --serve             serve an existing dump on http://localhost:PORT
   --port N            port for --serve (default 8080)`;
 }
@@ -227,18 +233,22 @@ function extractRefs(body: string, base: string, domain: string): string[] {
   const add = (raw: string) => {
     raw = raw.trim().replace(/\\\//g, "/");
     if (!raw || /^(data:|javascript:|mailto:|about:|blob:|#)/i.test(raw)) return;
+    // reject things that are clearly not URLs (meta-tag prose, JS expressions)
+    if (!/^[\w./\-~%:@?=&+#;!$']+$/.test(raw) || !/[./]/.test(raw)) return;
     try {
       const u = new URL(raw, base);
       if (!/^https?:$/.test(u.protocol)) return;
       const host = u.hostname.toLowerCase();
       if (host !== domain && !host.endsWith(`.${domain}`)) return;
+      if (u.pathname.startsWith("/cdn-cgi/")) return; // Cloudflare's own scripts
       u.hash = "";
       found.add(u.href);
     } catch {}
   };
 
-  // HTML attributes
-  for (const m of body.matchAll(/\b(?:src|href|data-src|poster|content)\s*=\s*["']([^"'<>]+)["']/gi)) add(m[1]);
+  // HTML attributes (meta content only when it looks like a file)
+  for (const m of body.matchAll(/\bcontent\s*=\s*["']([^"'<>\s]+\.\w{2,5})["']/gi)) add(m[1]);
+  for (const m of body.matchAll(/\b(?:src|href|data-src|poster)\s*=\s*["']([^"'<>]+)["']/gi)) add(m[1]);
   // srcset
   for (const m of body.matchAll(/\bsrcset\s*=\s*["']([^"']+)["']/gi))
     for (const part of m[1].split(",")) add(part.trim().split(/\s+/)[0]);
@@ -250,6 +260,54 @@ function extractRefs(body: string, base: string, domain: string): string[] {
   for (const m of body.matchAll(lit)) add(m[1]);
 
   return [...found];
+}
+
+/** Undo `\xNN` string escaping, which obfuscated game clients use to hide paths. */
+function unescapeHex(js: string): string {
+  return js.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => {
+    const c = String.fromCharCode(parseInt(h, 16));
+    return c === "'" || c === '"' || c === "\\" ? `\\${c}` : c;
+  });
+}
+
+/**
+ * mope.io builds most image paths at runtime, e.g.
+ *   './assets/s/' + seasonID + '/skins/' + 'land/rabbit/200/rabbit' + '.png'
+ * so they never appear whole in the source. Rebuild likely paths from the
+ * fragments that do appear. Returned paths are relative to an asset root
+ * (the site root or an assets/s/<season>/ folder).
+ */
+function guessGamePaths(js: string): string[] {
+  const out = new Set<string>();
+  const strs = [...js.matchAll(/'([^'\\\n]{1,120})'|"([^"\\\n]{1,120})"/g)].map((m) => m[1] ?? m[2]);
+
+  // whole files: 'img/snowball.png', 'audio/click.mp3', 'shop/gem.png'
+  for (const s of strs)
+    if (/^\.?\/?[\w\-]+(\/[\w\-.]+)+\.(png|jpe?g|gif|webp|svg|mp3|ogg|wav|json)$/i.test(s))
+      out.add(s.replace(/^\.?\//, ""));
+
+  // full skin ids: 'land/rabbit/200/rabbit'
+  const animalDirs = new Set<string>();
+  for (const s of strs) {
+    const m = s.match(/^([a-z]+)\/(\w+)\/(\d+)\/(\w+)$/);
+    if (m) {
+      out.add(`skins/${s}.png`);
+      animalDirs.add(`${m[1]}/${m[2]}`);
+    }
+  }
+  // animal folders: 'skins/volcano/kingdragon/' or 'skins/land/' + '/tiger/'
+  for (const s of strs) {
+    const m = s.match(/^skins\/([a-z]+)\/(\w+)\/?$/);
+    if (m) animalDirs.add(`${m[1]}/${m[2]}`);
+  }
+  // body-part fragments: '/tail.png', '_head.png', '/ability.png'
+  const parts = new Set(strs.filter((s) => /^[\/_][\w\-]+\.png$/.test(s)));
+  for (const dir of animalDirs) {
+    const animal = dir.split("/")[1];
+    out.add(`skins/${dir}/0/${animal}.png`);
+    for (const p of parts) out.add(p.startsWith("/") ? `skins/${dir}/0${p}` : `skins/${dir}/0/${animal}${p}`);
+  }
+  return [...out];
 }
 
 // --------------------------------------------------------------- download --
@@ -273,11 +331,15 @@ async function exists(p: string) {
 
 async function dump(o: Opts) {
   const out = resolve(o.out);
-  console.log(`🦊 dumping ${o.domain} as it was around ${o.date} (±${o.windowDays}d) → ${out}`);
-
-  console.log("📜 asking the Wayback CDX index what it has…");
-  const captures = await listCaptures(o);
-  console.log(`   ${captures.size} unique URLs found`);
+  let captures = new Map<string, Capture>();
+  if (o.live) {
+    console.log(`🦊 dumping live https://${o.domain}/ → ${out}`);
+  } else {
+    console.log(`🦊 dumping ${o.domain} as it was around ${o.date} (±${o.windowDays}d) → ${out}`);
+    console.log("📜 asking the Wayback CDX index what it has…");
+    captures = await listCaptures(o);
+    console.log(`   ${captures.size} unique URLs found`);
+  }
 
   // Make sure the homepage is always in the queue even if CDX was shy about it.
   const queue: string[] = [];
@@ -300,13 +362,50 @@ async function dump(o: Opts) {
   }
 
   const manifest: Entry[] = [];
+  const guesses = new Set<string>();
+  let guessMisses = 0;
+  let seasons: string[] | undefined;
   let done = 0;
+
+  // Find which assets/s/<N>/ season folders exist by probing with a known skin.
+  const findSeasons = async (samples: string[]) => {
+    const hits: string[] = [];
+    for (let n = 0; n < 10; n++) {
+      for (const sample of samples) {
+        const res = await fetchRetry(`https://${o.domain}/assets/s/${n}/${sample}`);
+        await res.body?.cancel();
+        if (res.ok && !(res.headers.get("content-type") ?? "").includes("html")) {
+          hits.push(String(n));
+          break;
+        }
+      }
+    }
+    console.log(`   season folders on the server: ${hits.map((n) => `assets/s/${n}`).join(", ") || "none"}`);
+    return hits;
+  };
+
+  const addGuesses = async (js: string) => {
+    const paths = guessGamePaths(unescapeHex(js));
+    if (!paths.length) return;
+    seasons ??= await findSeasons(paths.filter((p) => /^skins\/\w+\/(\w+)\/0\/\1\.png$/.test(p)).slice(0, 5));
+    let n = 0;
+    for (const p of paths)
+      for (const root of p.startsWith("assets/") ? [""] : ["", ...seasons.map((s) => `assets/s/${s}/`)]) {
+        const u = `https://${o.domain}/${root}${p}`;
+        if (!seen.has(urlKey(u))) {
+          guesses.add(urlKey(u));
+          enqueue(u);
+          n++;
+        }
+      }
+    console.log(`   🔮 queued ${n} guessed game-asset paths`);
+  };
 
   const work = async (url: string) => {
     const cap = captures.get(urlKey(url));
     // With an exact capture use its timestamp; otherwise let Wayback redirect to the nearest one.
     const ts = cap?.timestamp ?? o.date;
-    const wb = `https://web.archive.org/web/${ts}id_/${cap?.original ?? url}`;
+    const wb = o.live ? url : `https://web.archive.org/web/${ts}id_/${cap?.original ?? url}`;
     const file = localPath(out, cap?.original ?? url, cap?.mimetype);
     const entry: Entry = { url, timestamp: cap?.timestamp, file: file.slice(out.length + 1), status: "ok" };
 
@@ -318,7 +417,9 @@ async function dump(o: Opts) {
         entry.note = "already on disk";
       } else {
         const res = await fetchRetry(wb);
-        if (!res.ok) {
+        // SPA-style servers answer unknown paths with the HTML shell; treat that as a miss for guesses
+        const isFakeHit = guesses.has(urlKey(url)) && (res.headers.get("content-type") ?? "").includes("html");
+        if (!res.ok || isFakeHit) {
           entry.status = "missing";
           entry.note = `HTTP ${res.status}`;
           await res.body?.cancel();
@@ -326,6 +427,7 @@ async function dump(o: Opts) {
         }
         const m = res.url.match(/\/web\/(\d{14})/);
         if (m) entry.timestamp = m[1];
+        if (o.live) entry.timestamp = msToTs(Date.now());
         contentType = res.headers.get("content-type") ?? contentType;
         body = new Uint8Array(await res.arrayBuffer());
         await mkdir(dirname(file), { recursive: true });
@@ -334,15 +436,22 @@ async function dump(o: Opts) {
       entry.bytes = body.byteLength;
 
       if (o.crawl && (TEXTY.test(file) || /html|javascript|css|json/.test(contentType))) {
-        const text = new TextDecoder().decode(body);
+        let text = new TextDecoder().decode(body);
+        const isJs = /\.m?js(__|$)/.test(file) || contentType.includes("javascript");
+        if (isJs) text = unescapeHex(text);
         for (const ref of extractRefs(text, cap?.original ?? url, o.domain)) enqueue(ref);
+        if (o.live && isJs) await addGuesses(text);
       }
     } catch (e) {
       entry.status = "error";
       entry.note = String(e);
     } finally {
-      manifest.push(entry);
       done++;
+      if (entry.status === "missing" && guesses.has(urlKey(url))) {
+        guessMisses++;
+        return; // wrong guesses are expected; keep the log and manifest clean
+      }
+      manifest.push(entry);
       const icon = entry.status === "ok" ? "✓" : entry.status === "missing" ? "·" : "✗";
       console.log(`[${done}/${queue.length}] ${icon} ${entry.timestamp ?? "????????"} ${url}${entry.note ? `  (${entry.note})` : ""}`);
     }
@@ -373,13 +482,15 @@ async function dump(o: Opts) {
   manifest.sort((a, b) => a.url.localeCompare(b.url));
   const summary = {
     domain: o.domain,
-    targetDate: o.date,
+    source: o.live ? "live" : "wayback",
+    targetDate: o.live ? null : o.date,
     windowDays: o.windowDays,
     generatedAt: new Date().toISOString(),
     counts: {
       ok: manifest.filter((e) => e.status === "ok").length,
       missing: manifest.filter((e) => e.status === "missing").length,
       error: manifest.filter((e) => e.status === "error").length,
+      wrongGuesses: guessMisses,
     },
     files: manifest,
   };

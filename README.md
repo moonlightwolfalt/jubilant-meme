@@ -7,6 +7,20 @@ bun dump-mope.ts                 # → ./dump/mope.io/... + dump/manifest.json
 bun dump-mope.ts --serve         # browse it at http://localhost:8080
 ```
 
+### Live site (v1.mope.io)
+
+```sh
+bun dump-mope.ts --live --domain v1.mope.io --out dump-v1 --concurrency 8
+bun dump-mope.ts --serve --out dump-v1 --domain v1.mope.io
+```
+
+In `--live` mode it crawls the current site directly instead of the archive. The game client
+(`client.js`) is obfuscated and builds most image paths at runtime
+(`'./assets/s/' + season + '/skins/' + 'land/rabbit/200/rabbit' + '.png'`), so the script decodes
+its `\xNN` strings, rebuilds likely asset paths from the fragments it finds, finds which
+`assets/s/<N>/` season folders exist, and tries each guess. Wrong guesses are counted but kept out of
+the log and manifest.
+
 Options: `--date YYYYMMDD`, `--window <days>` (how far from the date to look for captures, default 30),
 `--out <dir>`, `--concurrency <n>` (default 4), `--domain <host>`, `--no-crawl`, `--dry-run`.
 
