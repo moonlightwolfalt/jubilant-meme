@@ -43,7 +43,7 @@ function parseArgs(argv: string[]): Opts {
     date: "20210321",
     windowDays: 30,
     out: "dump",
-    concurrency: 4,
+    concurrency: 70,
     domain: "mope.io",
     crawl: true,
     dryRun: false,
@@ -87,7 +87,7 @@ function readHelp() {
   --date YYYYMMDD     target snapshot date (default 20210321)
   --window N          how many days either side to look for captures (default 30)
   --out DIR           output folder (default ./dump)
-  --concurrency N     parallel downloads (default 4; be kind to archive.org)
+  --concurrency N     parallel downloads (default 70; be kind to archive.org)
   --domain HOST       site to dump (default mope.io, subdomains included)
   --no-crawl          only download what the CDX listing returns
   --dry-run           list what would be downloaded, write nothing

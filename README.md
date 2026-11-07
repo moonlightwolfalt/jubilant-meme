@@ -22,7 +22,7 @@ its `\xNN` strings, rebuilds likely asset paths from the fragments it finds, fin
 the log and manifest.
 
 Options: `--date YYYYMMDD`, `--window <days>` (how far from the date to look for captures, default 30),
-`--out <dir>`, `--concurrency <n>` (default 4), `--domain <host>`, `--no-crawl`, `--dry-run`.
+`--out <dir>`, `--concurrency <n>` (default 70), `--domain <host>`, `--no-crawl`, `--dry-run`.
 
 How it works: it lists every mope.io capture (subdomains included) via the Wayback CDX API, picks the
 capture closest to the target date for each URL, downloads the raw files (`id_` URLs, no toolbar), then
