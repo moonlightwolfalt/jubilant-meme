@@ -1,0 +1,9 @@
+{
+  "name": "mope-dump",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dump": "bun dump-mope.ts",
+    "serve": "bun dump-mope.ts --serve"
+  }
+}
